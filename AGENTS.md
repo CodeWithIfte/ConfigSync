@@ -3,7 +3,7 @@
 ## Overview
 
 Build a Shopify app (React Router v7 + TypeScript + Prisma/SQLite) for a Magento-to-Shopify migration. The app handles:
-1. **Product Configurator Engine** — unlimited product options with conditional visibility and price adders
+1. **Product Configurator Engine** — unlimited product options with conditional visibility, price adders, and rule-based product assignment
 2. **Order Sync to HoodslyHub** — webhook-driven order sync with retry logic
 
 ---
@@ -28,21 +28,22 @@ Build a Shopify app (React Router v7 + TypeScript + Prisma/SQLite) for a Magento
 ```
 config-sync/
 ├── prisma/
-│   └── schema.prisma               # Add SyncLog model
+│   └── schema.prisma               # Add Option, OptionSet, OptionSetAssignment, SyncLog models
 ├── app/
 │   ├── types/
 │   │   └── configurator.ts         # Configurator type definitions
 │   ├── services/
-│   │   ├── configurator.server.ts  # Metafield CRUD via Admin GraphQL
+│   │   ├── configurator.server.ts  # Option & OptionSet CRUD via Admin GraphQL + metafields
 │   │   └── hoodsly-sync.server.ts  # Sync + retry with exponential backoff
 │   ├── routes/
 │   │   ├── app.tsx                 # Update nav links
-│   │   ├── app._index.tsx          # Dashboard
-│   │   ├── app.configurator.$id.tsx # Admin configurator editor
-│   │   ├── app.sync-log.tsx        # Admin sync status log
+│   │   ├── app._index.tsx          # Dashboard — list Option Sets
+│   │   ├── app.option-sets.$id.tsx # Admin: create/edit Option Set (configurator)
+│   │   ├── app.options.$id.tsx     # Admin: create/edit individual reusable Options
+│   │   ├── app.sync-log.tsx        # Admin: sync status log
 │   │   ├── webhooks.orders.create.tsx # orders/create webhook
 │   │   └── mock.hoodsly-hub.tsx    # Mock endpoint
-│   └── shopify.server.ts           # Existing — add webhook registrar
+│   └── shopify.server.ts           # Existing
 ├── extensions/
 │   ├── product-configurator/       # Theme App Extension (storefront)
 │   └── cart-transform/             # Shopify Function (price calculation)
@@ -55,15 +56,94 @@ config-sync/
 
 ## Data Models
 
-### Configurator Definition (stored as product metafield `namespace:"app", key:"configurator"`, type `json`)
+### Design Rationale
+
+The configurator has two distinct scalability concerns:
+
+1. **Product assignment resolution** — "Which OptionSets apply to product X?" This is a high-frequency query (every storefront page load). We normalize assignments into a separate indexed table (`OptionSetAssignment`) so this is an indexed O(log n) lookup instead of O(n) JSON scan.
+
+2. **Configurator field definitions** — Read/written as a complete document per Option Set. Each Option Set has a small number of fields (typically 10–30). Storing `fields` as JSON avoids 3 extra tables (`OptionSetField`, `FieldOption`, `FieldCondition`) with complex joins for minimal query benefit. The JSON is validated with Zod before save.
+
+### Option (stored in Prisma — reusable field templates)
+
+```prisma
+model Option {
+  id          String   @id @default(uuid())
+  title       String
+  type        String   // "dropdown" | "radio" | "text" | "info_block"
+  label       String
+  required    Boolean  @default(false)
+  options     String?  // JSON array of ConfiguratorOption (for dropdown/radio)
+  placeholder String?  // for text
+  content     String?  // for info_block
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+}
+```
+
+### OptionSet (stored in Prisma)
+
+```prisma
+model OptionSet {
+  id              String    @id @default(uuid())
+  title           String
+  status          Boolean   @default(true)
+  rank            Int       @default(0)
+  assignmentType  String    // "manual" | "automatic"
+  autoCollections String?   // JSON array of collection IDs (for automatic assignment)
+  autoTags        String?   // Comma-separated product tags (for automatic)
+  autoVendor      String?   // Vendor name (for automatic)
+  fields          String    // JSON array of ConfiguratorField (the configurator definition)
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  assignments     OptionSetAssignment[]
+
+  @@index([status])
+  @@index([assignmentType])
+}
+```
+
+### OptionSetAssignment (normalized product-to-OptionSet mapping)
+
+```prisma
+model OptionSetAssignment {
+  id          String    @id @default(uuid())
+  optionSetId String
+  optionSet   OptionSet @relation(fields: [optionSetId], references: [id], onDelete: Cascade)
+  productId   String    // Shopify product GID
+
+  @@unique([optionSetId, productId])
+  @@index([productId])
+  @@index([optionSetId])
+}
+```
+
+This enables O(log n) lookups:
+
+```sql
+-- "Which OptionSets apply to product X?"
+SELECT * FROM OptionSetAssignment 
+WHERE productId = 'gid://shopify/Product/123'
+-- Indexed on [productId] — fast
+```
+
+vs. the old design which required loading every OptionSet and parsing JSON arrays.
+
+### ConfiguratorField (stored as JSON in OptionSet.fields)
 
 ```typescript
 type FieldType = "dropdown" | "radio" | "text" | "info_block";
 
+type AddOnType = "none" | "price" | "product";
+
 interface ConfiguratorOption {
   label: string;
   value: string;
-  priceDelta: number;   // cents
+  isDefault: boolean;
+  addOnType: AddOnType;       // "none" | "price" | "product"
+  priceDelta?: number;        // cents, when addOnType = "price"
+  addOnProductId?: string;    // Shopify product GID, when addOnType = "product"
 }
 
 interface VisibilityCondition {
@@ -80,17 +160,13 @@ interface ConfiguratorField {
   displayOrder: number;
   options?: ConfiguratorOption[];
   conditions?: VisibilityCondition[];  // AND logic
-  defaultValue?: string;
-  placeholder?: string;   // for text
-  content?: string;       // for info_block
-}
-
-interface ConfiguratorDefinition {
-  fields: ConfiguratorField[];
+  defaultValue?: string;        // references ConfiguratorOption.value
+  placeholder?: string;         // for text
+  content?: string;             // for info_block
 }
 ```
 
-### Prisma — SyncLog
+### SyncLog (stored in Prisma)
 
 ```prisma
 model SyncLog {
@@ -105,6 +181,9 @@ model SyncLog {
   payload       String   // JSON
   createdAt     DateTime @default(now())
   updatedAt     DateTime @updatedAt
+
+  @@index([status])
+  @@index([orderId])
 }
 ```
 
@@ -112,12 +191,20 @@ model SyncLog {
 
 ## Phase 1 — Foundation
 
-1. Update `prisma/schema.prisma` — add `SyncLog` model
-2. Run `prisma migrate dev` to create the table
+1. Update `prisma/schema.prisma` — add `Option`, `OptionSet`, `OptionSetAssignment`, and `SyncLog` models
+2. Run `prisma migrate dev` to create the tables
 3. Create `app/types/configurator.ts` — TypeScript types + Zod schemas
 4. Create `app/services/configurator.server.ts`:
-   - `getConfigurator(productId, admin)` — fetch metafield via GraphQL
-   - `saveConfigurator(productId, definition, admin)` — upsert metafield via `metafieldsSet`
+   - `getOptionSets(admin)` — list all Option Sets
+   - `getOptionSet(id, admin)` — fetch a single Option Set
+   - `saveOptionSet(data, admin)` — create/update Option Set
+   - `deleteOptionSet(id, admin)` — remove Option Set
+   - `getOptions(admin)` — list all reusable Options
+   - `getOption(id, admin)` — fetch a single Option
+   - `saveOption(data, admin)` — create/update Option
+   - `deleteOption(id, admin)` — remove Option
+   - `assignConfiguratorToProduct(productId, optionSet, admin)` — write configurator metafield to a product via `metafieldsSet`
+   - `syncManualAssignments(optionSet, admin)` — write configurator metafield to all manually-assigned products
 5. Create `app/services/hoodsly-sync.server.ts`:
    - `syncOrder(orderPayload)` — POST to `/mock/hoodslyhub`
    - Exponential backoff: 2s → 4s → 8s
@@ -135,20 +222,85 @@ model SyncLog {
 
 ## Phase 2 — Task 1: Product Configurator
 
-1. Create `app/routes/app.configurator.$id.tsx`:
-   - Route: `/app/configurator/:productId`
-   - Load configurator definition from product metafield
-   - Form using Polaris Web Components:
-     - Product selector (search/combobox at top)
-     - Field list: each field has type, label, required, order, options, conditions
-     - "Add Field" / "Remove Field" buttons
-     - `ui-save-bar` for save/discard
-   - Save writes to product metafield via Admin GraphQL `metafieldsSet`
-2. Create `extensions/cart-transform/` (Shopify Function):
+### 2a. Option Creator (reusable field definitions)
+
+1. Type selector step:
+   - When clicking "Create new option", first show a type selector overlay/page
+   - Four type cards/buttons: dropdown, radio, text, info_block
+   - After selecting, navigate to `/app/options/new?type=dropdown`
+
+2. Create `app/routes/app.options.$id.tsx`:
+   - Route: `/app/options/:id` (where `id` = "new" for creation)
+   - Reads `?type=` query param to pre-select the field type
+   - Form fields:
+     - **Title** — text field (internal name for the Option)
+     - **Label** — text input (displayed to customers)
+     - **Required** — toggle
+   - For **dropdown / radio**: options list with add/remove rows
+     - Each option row has:
+       - **Label** — text input (what customer sees)
+       - **Value** — text input (internal value)
+       - **isDefault** — checkbox (pre-selected in storefront)
+       - **Add-on type** — select: "None" | "Price" | "Product"
+       - If "Price": **$ price** — number input (positive integer, cents)
+       - If "Product": **product selector** — search/combobox to pick a Shopify product
+   - For **text**: placeholder input
+   - For **info_block**: content textarea
+   - Save/Discard via `ui-save-bar`
+   - On save: creates/updates `Option` record in Prisma
+   - Redirects back to options list or returns to option-set editor via query param (`?returnTo=/app/option-sets/:id`)
+
+### 2b. Option Set Editor (configurator builder)
+
+Flesh out `app/routes/app.option-sets.$id.tsx` (existing route):
+- **Title & Rank** — text field and number field (existing)
+- **Status** — active/draft toggle
+- **Fields section** — replaces the placeholder "Options" section:
+  - List of fields with display order (number inputs for reordering)
+  - Each field shows: type badge, label, required indicator, expand for details
+  - **"Add inline field"** — creates a new ConfiguratorField directly in the fields array (type, label, options, etc.)
+    - For dropdown/radio: each option row has label, value, isDefault, add-on type (none/price/product), price or product selector
+  - **"Add existing option"** — opens a picker/modal listing saved Options from Prisma; selecting one snapshots its definition into the fields array
+  - **"Create new option"** — navigates to `/app/options/new?returnTo=/app/option-sets/:id`
+  - "Remove Field" button per field
+- **Rules section** — conditional visibility per field (existing placeholder → working):
+  - Expand each field to edit conditions
+  - Each condition: fieldId selector, operator (equals/not_equals), value
+  - "Add Condition" / "Remove Condition" per field
+- **Add to products sidebar** (existing placeholder → working):
+  - `<s-choice-list>` with Manual / Automatic
+  - Manual: product search/combobox (multi-select) to pick specific products
+  - Automatic: collection selector(s), tags input, vendor selector/dropdown
+- **Save/Discard** via existing `ui-save-bar`
+- On save:
+  - Creates/updates `OptionSet` record in Prisma
+  - Replaces `OptionSetAssignment` rows for this OptionSet (delete old, insert new)
+  - For manual assignment: writes configurator metafield to each selected product via Admin GraphQL `metafieldsSet`
+  - For automatic: stores the rules, no metafield write (resolved at storefront render time)
+
+### 2c. Dashboard
+
+Update `app/routes/app._index.tsx`:
+- Replace template boilerplate
+- List all Option Sets with title, status (badge), assignment type, product count, created date
+- "Create Option Set" button → navigates to `/app/option-sets/new`
+- Edit, delete, duplicate actions per row
+
+### 2d. Nav
+
+Update `app/routes/app.tsx` nav:
+- "Option Sets" → `/app`
+- "Options" → `/app/options` (if a list view exists) or skip for now
+- "Sync Log" → `/app/sync-log`
+
+### 2e. Storefront
+
+1. Create `extensions/cart-transform/` (Shopify Function):
    - `shopify.function.extension.toml` (type `cart_transform`)
    - `input.graphql` — query line item properties + product metafield
    - `src/run.js` — parse `_configurator` property, look up price deltas, output `cost.subtotalAdjustments`
-3. Create `extensions/product-configurator/` (Theme App Extension):
+
+2. Create `extensions/product-configurator/` (Theme App Extension):
    - `shopify.extension.toml` (type `theme`)
    - `blocks/configurator.liquid`:
      - Access `product.metafields.app.configurator.value`
@@ -158,7 +310,6 @@ model SyncLog {
      - Conditional show/hide based on conditions (AND logic)
      - Calculate total price adder
      - On "Add to Cart": gather selections into hidden form data as JSON property `_configurator`
-4. Update `app/routes/app.tsx` nav — add "Configurator" link
 
 ---
 
@@ -170,11 +321,13 @@ model SyncLog {
    - Create `SyncLog` record with status `"pending"`
    - Call `syncOrder()`
    - Return 200
+
 2. Create `app/routes/app.sync-log.tsx`:
    - Route: `/app/sync-log`
    - Table: Order ID, Status (badge), Retry Count, Last Attempt, Error, Actions
    - Search by order ID, filter by status
    - "Retry" button (POST action) for failed/permanently_failed orders
+
 3. Update `app/routes/app.tsx` nav — add "Sync Log" link
 
 ---
@@ -183,14 +336,15 @@ model SyncLog {
 
 | Action | File |
 |---|---|
-| Modify | `prisma/schema.prisma` — add SyncLog |
+| Modify | `prisma/schema.prisma` — add Option, OptionSet, OptionSetAssignment, SyncLog |
 | Modify | `shopify.app.toml` — metafield, webhook, scopes |
 | **New** | `app/types/configurator.ts` |
 | **New** | `app/services/configurator.server.ts` |
 | **New** | `app/services/hoodsly-sync.server.ts` |
 | Modify | `app/routes/app.tsx` — update nav |
-| Modify | `app/routes/app._index.tsx` — dashboard |
-| **New** | `app/routes/app.configurator.$id.tsx` |
+| Modify | `app/routes/app._index.tsx` — list Option Sets |
+| Modify | `app/routes/app.option-sets.$id.tsx` — full configurator editor |
+| **New** | `app/routes/app.options.$id.tsx` — Option creator |
 | **New** | `app/routes/app.sync-log.tsx` |
 | **New** | `app/routes/webhooks.orders.create.tsx` |
 | **New** | `app/routes/mock.hoodsly-hub.tsx` |
@@ -207,9 +361,13 @@ model SyncLog {
 
 ## Key Design Decisions
 
-- **Configurator stored as product metafield (JSON)** — no separate DB table, travels with product data natively
+- **Option as reusable template** — standalone Options are created once in `/app/options/:id` and can be snapshotted into any Option Set. No live references — Option Set stores the full field definition at time of addition
+- **Option Set as primary entity** — configurator is defined as a reusable Option Set, not per-product. Matches existing app UI pattern
+- **Manual assignment normalized into `OptionSetAssignment`** — indexed by `productId` for O(log n) lookup. Replaces the previous JSON-in-column approach which required O(n) full table scans
+- **`fields` kept as JSON** — each Option Set has a small number of fields (10–30). Normalizing into separate tables (OptionSetField, FieldOption, FieldCondition) adds join complexity without meaningful query benefit at this scale
+- **Manual assignment writes product metafield** — for manually-assigned products, the configurator JSON is written to the product metafield so the storefront can read it directly
+- **Automatic assignment resolved at render time** — Theme App Extension evaluates automatic rules (collections, tags, vendor) against the current product at render time. This avoids needing to update dozens of product metafields when rules change
 - **Price adders via Cart Transform Function** — bypasses Shopify's 100-variant limit; unlimited options with individual deltas
-- **Theme App Extension for storefront** — merchant installs as app block; no theme code modification needed
 - **In-process retry** — `setTimeout`-based exponential backoff (2s/4s/8s), status persisted to SQLite; no external queue needed
 - **Mock endpoint with `?fail=true`** — test failure + retry behavior easily
 - **Polaris Web Components (`s-*`)** — already the project convention over React Polaris
@@ -243,8 +401,10 @@ HOODSLY_HUB_URL=http://localhost:3000/mock/hoodslyhub
 1. `npm run typecheck` — TypeScript passes
 2. `npm run lint` — ESLint passes
 3. `shopify app dev` — app starts and tunnel is accessible
-4. Admin UI: navigate to `/app/configurator/:id` → create configurator → save
-5. Storefront: add configured product to cart → verify price (base + adders)
-6. Checkout → order appears in admin with line item properties
-7. Order sync log shows `"synced"` status
-8. `?fail=true` on mock → log shows retries → `"permanently_failed"` → manual retry works
+4. Create a reusable Option (color dropdown with Red +$5), save
+5. Create Option Set → add existing Option (color) → add inline field (size radio with Large +$10) → set conditions → assign manually to a product → save
+6. Storefront: product page shows configurator → configure → add to cart
+7. Verify cart price = base + selected adders
+8. Complete checkout → order shows line item properties in admin
+9. Order sync log shows `"synced"` status
+10. `?fail=true` on mock → log shows retries → `"permanently_failed"` → manual retry works
