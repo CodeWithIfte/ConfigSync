@@ -32,3 +32,63 @@ model Session {
   refreshToken        String?
   refreshTokenExpires DateTime?
 }
+
+model Option {
+  id          String   @id @default(uuid())
+  title       String
+  type        String
+  label       String
+  required    Boolean  @default(false)
+  options     String?
+  placeholder String?
+  content     String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+}
+
+model OptionSet {
+  id              String    @id @default(uuid())
+  title           String
+  status          Boolean   @default(true)
+  rank            Int       @default(0)
+  assignmentType  String
+  autoCollections String?
+  autoTags        String?
+  autoVendor      String?
+  fields          String
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  assignments     OptionSetAssignment[]
+
+  @@index([status])
+  @@index([assignmentType])
+}
+
+model OptionSetAssignment {
+  id          String   @id @default(uuid())
+  optionSetId String
+  optionSet   OptionSet @relation(fields: [optionSetId], references: [id], onDelete: Cascade)
+  productId   String
+
+  @@unique([optionSetId, productId])
+  @@index([productId])
+  @@index([optionSetId])
+}
+
+model SyncLog {
+  id            String    @id @default(uuid())
+  shop          String
+  orderId       String    @unique
+  status        String
+  retryCount    Int       @default(0)
+  lastAttemptAt DateTime?
+  nextRetryAt   DateTime?
+  errorMessage  String?
+  payload       String
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  @@index([status])
+  @@index([orderId])
+}

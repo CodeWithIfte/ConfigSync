@@ -1,5 +1,13 @@
 # ConfigSync — Shopify App Build Plan
 
+## Environment Constraints
+
+- **Node version:** v20.20.2 (local) — `@shopify/polaris-types` requires >=22.18.0 but this is a devDep, so app code works
+- **Package manager:** pnpm 9.0.0 — `@shopify/polaris-types` requires pnpm >=10.2.0 but this is a devDep
+- **Workaround for installs:** Use `pnpm add -w <pkg> --ignore-engines` to bypass engine checks for devDeps
+- **Prisma commands:** Run `npx prisma migrate dev` directly (works with node v20)
+- **Do NOT run pnpm or prisma commands autonomously** — ask the user to execute them
+
 ## Overview
 
 Build a Shopify app (React Router v7 + TypeScript + Prisma/SQLite) for a Magento-to-Shopify migration. The app handles:
@@ -374,6 +382,11 @@ Update `app/routes/app.tsx` nav:
 
 ---
 
+## Known Deployment Constraints
+
+- **`orders/create` webhook** — Removed from `shopify.app.toml` because it requires Shopify protected customer data approval before deployment. The route handler (`app/routes/webhooks.orders.create.tsx`) and `HOODSLY_HUB_URL` env var remain in place. Re-add the webhook subscription after the app passes protected customer data review. See https://shopify.dev/docs/apps/launch/protected-customer-data
+- **`write_orders,read_orders` scopes** — Also removed from `shopify.app.toml` and `.env.example` for the same reason. Re-add after protected customer data approval.
+
 ## Not Implemented (Deferred)
 
 Bonus tasks deferred per discussion:
@@ -389,7 +402,7 @@ Bonus tasks deferred per discussion:
 ```
 SHOPIFY_API_KEY=
 SHOPIFY_API_SECRET=
-SCOPES=write_products,write_metaobjects,write_metaobject_definitions,write_orders,read_orders
+SCOPES=write_products,write_metaobjects,write_metaobject_definitions
 SHOPIFY_APP_URL=
 HOODSLY_HUB_URL=http://localhost:3000/mock/hoodslyhub
 ```
